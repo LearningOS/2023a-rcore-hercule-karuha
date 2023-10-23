@@ -17,11 +17,14 @@ mod task;
 use crate::config::MAX_APP_NUM;
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
+use crate::timer::get_time_ms;
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
+
+use crate::syscall::TaskInfo;
 
 /// The task manager, where all the tasks are managed.
 ///
@@ -54,6 +57,8 @@ lazy_static! {
         let mut tasks = [TaskControlBlock {
             task_cx: TaskContext::zero_init(),
             task_status: TaskStatus::UnInit,
+            syscall_times:[0;5],
+            start_time:0
         }; MAX_APP_NUM];
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
@@ -81,6 +86,10 @@ impl TaskManager {
         let task0 = &mut inner.tasks[0];
         task0.task_status = TaskStatus::Running;
         let next_task_cx_ptr = &task0.task_cx as *const TaskContext;
+
+        // 保存第一次调度的时间
+        task0.start_time = get_time_ms();
+
         drop(inner);
         let mut _unused = TaskContext::zero_init();
         // before this, we should drop local variables that must be dropped manually
@@ -125,6 +134,17 @@ impl TaskManager {
             inner.current_task = next;
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
+
+            let next_task_tcb = &mut inner.tasks[next];
+
+            if next_task_tcb.start_time == 0 {
+                next_task_tcb.start_time = get_time_ms();
+                debug!(
+                    "set task = {:#x} start_time = {:#x}",
+                    next, next_task_tcb.start_time
+                );
+            }
+
             drop(inner);
             // before this, we should drop local variables that must be dropped manually
             unsafe {
@@ -134,6 +154,58 @@ impl TaskManager {
         } else {
             panic!("All applications completed!");
         }
+    }
+
+    fn inscrease_syscall_times(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let curr_task_tcb = &mut inner.tasks[current];
+
+        match syscall_id {
+            64 => curr_task_tcb.syscall_times[0] += 1,
+            93 => curr_task_tcb.syscall_times[1] += 1,
+            124 => curr_task_tcb.syscall_times[2] += 1,
+            169 => curr_task_tcb.syscall_times[3] += 1,
+            410 => curr_task_tcb.syscall_times[4] += 1,
+            _ => {}
+        }
+
+        drop(inner);
+    }
+
+    fn set_task_info(&self, task_info: *mut TaskInfo) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let curr_task_tcb = &mut inner.tasks[current];
+
+        let curr_time = get_time_ms();
+
+        debug!(
+            "task info current = {:#x} curr_time() = {:#x} curr start_time = {:#x}",
+            current, curr_time, curr_task_tcb.start_time
+        );
+
+        unsafe {
+            (*task_info).time = curr_time - curr_task_tcb.start_time;
+            // (*task_info)
+            //     .syscall_times
+            //     .copy_from_slice(&curr_task_tcb.syscall_times);
+
+            (*task_info).syscall_times[64] = curr_task_tcb.syscall_times[0];
+            (*task_info).syscall_times[93] = curr_task_tcb.syscall_times[1];
+            (*task_info).syscall_times[124] = curr_task_tcb.syscall_times[2];
+            (*task_info).syscall_times[169] = curr_task_tcb.syscall_times[3];
+            (*task_info).syscall_times[410] = curr_task_tcb.syscall_times[4];
+
+            (*task_info).status = TaskStatus::Running;
+        }
+
+        // task_info.time = curr_time - curr_task_tcb.start_time;
+        // task_info
+        //     .syscall_times
+        //     .copy_from_slice(&curr_task_tcb.syscall_times);
+
+        drop(inner);
     }
 }
 
@@ -168,4 +240,14 @@ pub fn suspend_current_and_run_next() {
 pub fn exit_current_and_run_next() {
     mark_current_exited();
     run_next_task();
+}
+
+/// 增加syscall调用次数
+pub fn syscall_inc(syscall_id: usize) {
+    TASK_MANAGER.inscrease_syscall_times(syscall_id);
+}
+
+/// 设置taskinfo
+pub fn set_task_info(task_info: *mut TaskInfo) {
+    TASK_MANAGER.set_task_info(task_info);
 }
